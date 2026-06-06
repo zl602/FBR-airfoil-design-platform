@@ -8,3 +8,5 @@ For more project details, please read FBR project doc
 
 
 To run tool_box, run combined_app.py instead of main.py
+
+Panel methond for multi-element wing is under development
