@@ -209,13 +209,16 @@ def run_xfoil_sweep(name, coords, panel, alphas, reynold, xfoil_path):
     for i, a in enumerate(alphas):
         if a not in polar or not os.path.exists(cp_files[i]):
             continue
-        cl, cd, _, cm = polar[a][:4]
+        cl, cd, _, cm, xtr_top, xtr_bot = polar[a][:6]
         cp = np.loadtxt(cp_files[i], skiprows=3)[:, [0, 2]]
-        _, _, sep_x = analyze_cf_data(cf_files[i])
+        side = 0 if cl >= 0 else 1          # 吸力面：CL < 0 时为下表面
+        _, _, sep_x = analyze_cf_data(cf_files[i], side)
         results.append({
             "alpha": a, "cl": cl, "cd": cd, "cm": cm,
             "ld": cl / cd if cd else None,
             "cp": cp, "sep_x": sep_x,
+            "sep_side": "upper" if side == 0 else "lower",
+            "xtr": xtr_top if side == 0 else xtr_bot,   # 吸力面转捩位置
         })
 
     for f in generated:
@@ -226,7 +229,8 @@ def assess_credibility(results, reynold=1e6):
     """
     基于 airfoil_database 1.3 的数据清洗规则，给扫描结果标记可信度：
     r['warnings'] 为原因列表，空列表表示可信。
-      1. 分离点：x/c < 0.1 为前缘失速；x/c <= 0.7 为失速发展（0.7 之后的尾缘分离可接受）
+      1. 分离点（吸力面）：x/c < 0.1 为前缘失速；x/c <= 0.7 且位于转捩点之后（湍流分离）为失速发展
+         （0.7 之后的尾缘分离可接受）
       2. 阈值：CL >= 3、CD >= CD_lim(Re)、L/D >= 300 视为超出可信范围
       3. 梯度：L/D 出现孤立尖峰 / 下凹，视为数值异常
       4. 出现第 2 个失速点或第 8 个异常点后，数据库不再计算更远的攻角，这里统一标为超出可信范围
@@ -239,6 +243,8 @@ def assess_credibility(results, reynold=1e6):
       - L/D 不再看"比前一攻角涨了多少"（与步长有关，线性段正常上升也会触发），
         改为与前后两个攻角的线性插值比较，偏离 >= 40% 才算异常（只看曲线弯折，与步长无关）；
         扫描端点只有一侧邻点，沿用原规则，但只在越过 L/D 极值之后检查
+      - 分离点只看吸力面（CL < 0 时为下表面），且转捩之前的层流分离不算失速：
+        低雷诺数下小攻角常出现尾缘附近的层流分离，并非失速
     放宽 CD 阈值后，低雷诺数下刚越过 CLmax 的一两个攻角可能不再被 CD 捕捉，因此另加：
       5. 越过整个扫描的 CL 最大值（负攻角一侧为 CL 最小值）之后的攻角，XFOIL 失速后结果不可信
     """
@@ -280,8 +286,13 @@ def assess_credibility(results, reynold=1e6):
                     stall_count = 3
                     warnings.append(f"Leading-edge stall: separation at x/c = {sep:.3f} (< 0.1)")
                 elif sep <= 0.7:
-                    stall_count += 1
-                    warnings.append(f"Stall developing: separation at x/c = {sep:.3f} (<= 0.7)")
+                    xtr = r.get('xtr')
+                    if xtr is not None and sep < xtr:
+                        pass      # 转捩之前的层流分离：低雷诺数下的正常现象，XFOIL 能模拟，不算失速
+                    else:
+                        stall_count += 1
+                        tr = f", transition at {xtr:.3f}" if xtr is not None else ""
+                        warnings.append(f"Stall developing: turbulent separation at x/c = {sep:.3f} (<= 0.7{tr})")
 
             weird = []
             if cl >= 3: weird.append(f"CL = {cl:.3f} (>= 3)")
@@ -424,27 +435,34 @@ def run_xfoil_naca_auto_kill(name, naca_code, panel, alpha, reynold, xfoil_path)
 
     return results, cf_file
 
-def analyze_cf_data(cf_file):
+def analyze_cf_data(cf_file, side=0):
     """
     高级解析器：区分分离气泡和永久分离
+    side: 0 = 上表面（文件第一段），1 = 下表面（第二段）
     返回格式: (bubble_start, bubble_end, true_separation_x)
     """
     if not os.path.exists(cf_file):
         return None, None, None
 
-    points = []
+    # XFOIL 的 Cf 文件依次是 上表面+尾迹（x 到 2）、下表面+尾迹；x 跳回前缘即为下一段
+    segments = [[]]
     with open(cf_file, 'r') as f:
         for line in f:
             parts = line.split()
             if len(parts) == 2:
                 try:
                     x, cf = float(parts[0]), float(parts[1])
-                    if x > 1.0: break  # 忽略尾迹区
-                    points.append((x, cf))
                 except: continue
+                if segments[-1] and x < segments[-1][-1][0] - 0.05:
+                    segments.append([])
+                segments[-1].append((x, cf))
+    if side >= len(segments):
+        return None, None, None
 
-    # 识别吸力面（第一段数据直到 x 到达 1.0）
-    # 如果数据里有两段，x 会从 1.0 跳回 0，这里逻辑只处理第一段
+    points = []
+    for x, cf in segments[side]:
+        if x > 1.0: break  # 忽略尾迹区
+        points.append((x, cf))
     
     bubble_start = None
     bubble_end = None

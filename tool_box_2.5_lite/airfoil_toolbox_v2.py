@@ -178,7 +178,9 @@ class Airfoil():
         mse_values = []
         for coords in [self.upper, self.lower]:
             coords = np.array(coords)
-            x, y = coords[:, 0], coords[:, 1]
+            # CST 只定义在 0 <= x <= 1；大弯度翼型（如 NACA 6412）前缘附近有 x 略小于 0 的点，
+            # 不夹紧的话 sqrt 得到 NaN，最小二乘直接失败
+            x, y = np.clip(coords[:, 0], 0.0, 1.0), coords[:, 1]
             C = x**0.5 * (1 - x)**1.0
             X = np.column_stack([C * (comb(order, i) * (x**i) * (1 - x)**(order - i)) for i in range(order + 1)])
             weights, _, _, _ = np.linalg.lstsq(X, y, rcond=None)

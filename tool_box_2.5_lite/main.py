@@ -104,17 +104,24 @@ class AirfoilApp(AirfoilGUI):
     def on_generate_naca(self):
         code, ok = QInputDialog.getText(self, "NACA", "Enter 4-digit code (e.g. 2412):")
         if ok and code:
-            self.af.generate_naca_with_header(code, self.airfoil_dir)
-            # 更新这里寻找的文件名后缀
-            file_path = os.path.join(self.airfoil_dir, f"naca{code}_xy.dat")
-            self.init_design_log(file_path)
-            self.process_airfoil_data(file_path)
+            # 槽函数里未捕获的异常会让 PyQt5 直接终止程序，这里改为弹窗提示
+            try:
+                self.af.generate_naca_with_header(code, self.airfoil_dir)
+                # 更新这里寻找的文件名后缀
+                file_path = os.path.join(self.airfoil_dir, f"naca{code}_xy.dat")
+                self.init_design_log(file_path)
+                self.process_airfoil_data(file_path)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to generate NACA {code}:\n{e}")
 
     def on_load_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Airfoil", "", "DAT (*.dat)")
-        if path: 
-            self.init_design_log(path)
-            self.process_airfoil_data(path)
+        if path:
+            try:
+                self.init_design_log(path)
+                self.process_airfoil_data(path)
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to load airfoil:\n{e}")
 
     def process_airfoil_data(self, path):
         self.af.load_csv_coords(path)
@@ -236,7 +243,11 @@ class AirfoilApp(AirfoilGUI):
         self.lbl_alpha.setText(f"Alpha: {r['alpha']:g}°   ({self.sweep_info})")
         self.lbl_cl.setText(f"CL: {r['cl']:.4f}"); self.lbl_cd.setText(f"CD: {r['cd']:.5f}")
         self.lbl_ld.setText(f"L/D: {r['ld']:.2f}" if r['ld'] is not None else "L/D: N/A")
-        self.lbl_sep.setText(f"Sep. Point: {r['sep_x']:.3f}" if r['sep_x'] else "Sep. Point: N/A")
+        if r['sep_x']:
+            laminar = r.get('xtr') is not None and r['sep_x'] < r['xtr']
+            self.lbl_sep.setText(f"Sep. Point: {r['sep_x']:.3f} ({r['sep_side']}{', laminar' if laminar else ''})")
+        else:
+            self.lbl_sep.setText("Sep. Point: N/A")
 
         # 存疑攻角：Cp 曲线变红，并在图上和滑块下方给出原因
         warnings = r['warnings']
