@@ -220,29 +220,54 @@ def run_xfoil_sweep(name, coords, panel, alphas, reynold, xfoil_path):
 
     for f in generated:
         if os.path.exists(f): os.remove(f)
-    return assess_credibility(results)
+    return assess_credibility(results, reynold)
 
-def assess_credibility(results):
+def assess_credibility(results, reynold=1e6):
     """
-    沿用 airfoil_database 1.3 的数据清洗规则，给扫描结果标记可信度：
+    基于 airfoil_database 1.3 的数据清洗规则，给扫描结果标记可信度：
     r['warnings'] 为原因列表，空列表表示可信。
       1. 分离点：x/c < 0.1 为前缘失速；x/c <= 0.7 为失速发展（0.7 之后的尾缘分离可接受）
-      2. 阈值：CL >= 3、CD >= 0.02、L/D >= 300 视为超出可信范围
-      3. 梯度：L/D 相对前一攻角突增 >= 40%（且前一点 |L/D| >= 40）视为数值异常
+      2. 阈值：CL >= 3、CD >= CD_lim(Re)、L/D >= 300 视为超出可信范围
+      3. 梯度：L/D 出现孤立尖峰 / 下凹，视为数值异常
       4. 出现第 2 个失速点或第 8 个异常点后，数据库不再计算更远的攻角，这里统一标为超出可信范围
     从最接近 0° 的攻角分别向正、负两侧推进判定（数据库从 0° 向上扫描）。
+
+    相对数据库放宽的两条（数据库的阈值是在 Re 5e5~1e6、0.1° 步长下定的，
+    直接用于低雷诺数和 1° 步长会在小攻角误报）：
+      - CD 阈值随雷诺数放宽：0.02 × max(1, (1e6/Re)^0.5)，层流摩阻约随 Re^-0.5 变化；
+        Re >= 1e6 时仍为 0.02
+      - L/D 不再看"比前一攻角涨了多少"（与步长有关，线性段正常上升也会触发），
+        改为与前后两个攻角的线性插值比较，偏离 >= 40% 才算异常（只看曲线弯折，与步长无关）；
+        扫描端点只有一侧邻点，沿用原规则，但只在越过 L/D 极值之后检查
+    放宽 CD 阈值后，低雷诺数下刚越过 CLmax 的一两个攻角可能不再被 CD 捕捉，因此另加：
+      5. 越过整个扫描的 CL 最大值（负攻角一侧为 CL 最小值）之后的攻角，XFOIL 失速后结果不可信
     """
     if not results:
         return results
+    cd_lim = CD_LIMIT_BASE * max(1.0, (1e6 / reynold) ** CD_LIMIT_RE_EXP)
+    ld_anomaly = _ld_anomalies(results)
     pivot = min(range(len(results)), key=lambda i: abs(results[i]['alpha']))
+
+    # 规则 5：用整段扫描的极值（而非局部极值），附着流区 CL 的小波动不会触发；
+    # 扫描未到失速时极值就在端点，不标记任何点
+    past_clmax = {}
+    pos, neg = results[pivot:], results[:pivot + 1]
+    if len(pos) > 1:
+        top = max(pos, key=lambda r: r['cl'])
+        for r in pos[pos.index(top) + 1:]:
+            if r['cl'] < top['cl']:
+                past_clmax[id(r)] = f"Past CLmax ({top['cl']:.3f} at {top['alpha']:g}°): XFOIL post-stall results are unreliable"
+    if len(neg) > 1:
+        bottom = min(neg, key=lambda r: r['cl'])
+        for r in neg[:neg.index(bottom)]:
+            if r['cl'] > bottom['cl']:
+                past_clmax[id(r)] = f"Past CLmin ({bottom['cl']:.3f} at {bottom['alpha']:g}°): XFOIL post-stall results are unreliable"
     branches = [results[pivot:], [results[pivot]] + results[:pivot][::-1]]
     for b, branch in enumerate(branches):
         stall_count, weird_count = 0, 0
-        prev = None
         for r in branch:
             if b > 0 and r is results[pivot]:
-                prev = r          # 负方向以 0° 附近的点作为梯度比较起点，不重复判定
-                continue
+                continue          # 0° 附近的点已在正方向判定过
             warnings = []
             if stall_count >= 2:
                 warnings.append("Beyond stall: past the 2nd stalled angle, XFOIL post-stall results are unreliable")
@@ -260,21 +285,71 @@ def assess_credibility(results):
 
             weird = []
             if cl >= 3: weird.append(f"CL = {cl:.3f} (>= 3)")
-            if cd >= 0.02: weird.append(f"CD = {cd:.4f} (>= 0.02)")
+            if cd >= cd_lim: weird.append(f"CD = {cd:.4f} (>= {cd_lim:.3f} at Re {reynold:.3g})")
             if ld is not None and ld >= 300: weird.append(f"L/D = {ld:.0f} (>= 300)")
             if weird:
                 weird_count += 1
                 warnings.append("Outside trusted range: " + ", ".join(weird))
 
-            if prev is not None and ld is not None and prev['ld'] and abs(prev['ld']) >= 40:
-                delta_ld = (ld - prev['ld']) / abs(prev['ld'])
-                if delta_ld >= 0.4:
-                    weird_count += 1
-                    warnings.append(f"L/D jumped {delta_ld:+.0%} from {prev['alpha']:g}° (numerical anomaly)")
+            if id(r) in ld_anomaly:
+                weird_count += 1
+                warnings.append(ld_anomaly[id(r)])
+
+            if id(r) in past_clmax:
+                warnings.append(past_clmax[id(r)])
 
             r['warnings'] = warnings
-            prev = r
     return results
+
+CD_LIMIT_BASE = 0.02       # 数据库在 Re 1e6 附近使用的 CD 上限
+CD_LIMIT_RE_EXP = 0.5      # 低雷诺数下的放宽指数（层流摩阻 ~ Re^-0.5）
+LD_JUMP = 0.4              # L/D 偏离 / 突增的判定比例
+LD_MIN = 40                # 参与比较的 |L/D| 下限（零升附近比例会被放大）
+
+def _ld_anomalies(results):
+    """返回 {id(结果): 原因}，标出 L/D 曲线上的孤立尖峰 / 下凹（results 按攻角升序）"""
+    out = {}
+    n = len(results)
+    ld = [r['ld'] for r in results]
+    al = [r['alpha'] for r in results]
+
+    # 中间点：与前后两点按攻角线性插值的期望值比较
+    dev, expected = {}, {}
+    for i in range(1, n - 1):
+        if None in (ld[i - 1], ld[i], ld[i + 1]):
+            continue
+        if min(abs(ld[i - 1]), abs(ld[i + 1])) < LD_MIN:
+            continue
+        e = ld[i - 1] + (ld[i + 1] - ld[i - 1]) * (al[i] - al[i - 1]) / (al[i + 1] - al[i - 1])
+        if abs(e) < LD_MIN:
+            continue
+        expected[i], dev[i] = e, (ld[i] - e) / abs(e)
+    for i, d in dev.items():
+        # 一个异常点会把相邻点的期望值也带偏，只标偏离最大的那个
+        if abs(d) >= LD_JUMP and all(abs(d) >= abs(dev.get(j, 0)) for j in (i - 1, i + 1)):
+            kind = "spike" if d > 0 else "dip"
+            out[id(results[i])] = (f"L/D {kind}: {ld[i]:.1f} vs {expected[i]:.1f} expected from "
+                                   f"{al[i - 1]:g}° and {al[i + 1]:g}° ({d:+.0%}, numerical anomaly)")
+
+    # 端点：只有一侧邻点。沿外推方向看 L/D（负攻角一侧取相反数），
+    # 端点之前的极值已经过去（L/D 本应下降）时仍突增 >= 40% 才算异常
+    pivot = min(range(n), key=lambda k: abs(al[k]))
+    ends = []
+    if n - 1 > pivot: ends.append((n - 1, n - 2, 1, range(pivot, n - 1)))   # 正攻角一侧
+    if pivot > 0:     ends.append((0, 1, -1, range(1, pivot + 1)))           # 负攻角一侧
+    for end, inner, sign, branch in ends:
+        if ld[end] is None or ld[inner] is None or abs(ld[inner]) < LD_MIN:
+            continue
+        s = {k: sign * ld[k] for k in branch if ld[k] is not None}
+        if not s:
+            continue
+        peak = max(s, key=s.get)           # 不含端点本身
+        past_peak = peak != inner          # 极值在 inner 之前，说明已在下降段
+        delta = (sign * ld[end] - sign * ld[inner]) / abs(ld[inner])
+        if past_peak and delta >= LD_JUMP:
+                out[id(results[end])] = (f"L/D jumped {delta:+.0%} from {al[inner]:g}° "
+                                         f"after the L/D peak (numerical anomaly)")
+    return out
 
 def run_xfoil_naca_auto_kill(name, naca_code, panel, alpha, reynold, xfoil_path):
     input_file = f"{name}.in"
