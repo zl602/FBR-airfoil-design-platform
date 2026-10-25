@@ -14,22 +14,18 @@ from matplotlib.figure import Figure
 # 导入 GUI 基类和核心工具
 from gui import AirfoilGUI
 from airfoil_toolbox_v2 import Airfoil
-from xfoil_ops import run_xfoil, analyze_cf_data
+from xfoil_ops import run_xfoil_sweep
 
 class XfoilWorker(QThread):
-    finished = pyqtSignal(dict, str, str) 
-    def __init__(self, name, coords, alpha, reynold, xfoil_path):
+    finished = pyqtSignal(object, int)  # (按攻角升序的结果列表, 请求的攻角数)
+    def __init__(self, name, coords, alphas, reynold, xfoil_path):
         super().__init__()
-        self.params = (name, coords, alpha, reynold, xfoil_path)
+        self.params = (name, coords, alphas, reynold, xfoil_path)
 
     def run(self):
-        name, coords, alpha, re, path = self.params
-        dat_file = f"{name}.dat"
-        with open(dat_file, "w") as f:
-            f.write(f"{name}\n" + "\n".join([f"{c[0]} {c[1]}" for c in coords]))
-        
-        results, _, _, status = run_xfoil(name, coords, 160, alpha, re, path)
-        self.finished.emit(results if status else {}, f"{name}_cf.txt", f"{name}_cp.txt")
+        name, coords, alphas, re, path = self.params
+        results = run_xfoil_sweep(name, coords, 160, alphas, re, path)
+        self.finished.emit(results, len(alphas))
 
 class AirfoilApp(AirfoilGUI):
     def __init__(self):
@@ -77,6 +73,11 @@ class AirfoilApp(AirfoilGUI):
         self.line_lo, = self.ax_foil.plot([], [], 'r-', lw=2, label='Lower')
         self.line_orig, = self.ax_foil.plot([], [], 'k.', markersize=3, alpha=0.3, label='Baseline') 
         self.line_cp, = self.ax_cp.plot([], [], 'g-', lw=1.5, label='Cp')
+        # 可信度警告：滑到存疑攻角时显示在 Cp 图右上角
+        self.cp_warn = self.ax_cp.text(
+            0.99, 0.97, "", transform=self.ax_cp.transAxes, ha='right', va='top',
+            fontsize=9, color='#b71c1c', visible=False, zorder=5,
+            bbox=dict(boxstyle='round,pad=0.4', fc='#ffebee', ec='#c62828'))
         self.ax_foil.legend(loc='upper right')
 
     def connect_signals(self):
@@ -86,6 +87,7 @@ class AirfoilApp(AirfoilGUI):
         self.btn_csv.clicked.connect(self.on_export_csv)
         self.btn_vba.clicked.connect(self.on_export_vba)
         self.btn_flip.clicked.connect(self.on_export_flipped)
+        self.sld_alpha.valueChanged.connect(self.show_sweep_point)
 
     def init_design_log(self, baseline_path):
         """在 design_logs 文件夹内创建日志"""
@@ -97,7 +99,7 @@ class AirfoilApp(AirfoilGUI):
             writer = csv.writer(f)
             writer.writerow([f"Generation Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
             writer.writerow([f"Baseline Airfoil Path: {os.path.abspath(baseline_path)}"])
-            writer.writerow(["Timestamp", "Upper CST Weights", "Lower CST Weights", "Re", "Alpha", "Cl", "Cd", "L/D", "Separation Point"])
+            writer.writerow(["Timestamp", "Upper CST Weights", "Lower CST Weights", "Re", "Alpha", "Cl", "Cd", "L/D", "Separation Point", "Credibility"])
 
     def on_generate_naca(self):
         code, ok = QInputDialog.getText(self, "NACA", "Enter 4-digit code (e.g. 2412):")
@@ -120,6 +122,7 @@ class AirfoilApp(AirfoilGUI):
         order = self.spin_order.value()
         up_w, lo_w = self.af.get_cst_parameters(order=order, plot_comparison=False, export_csv=False)
         self.orig_up, self.orig_lo = list(up_w.values()), list(lo_w.values())
+        self.clear_sweep()  # 旧翼型的扫描结果不再适用
         self.build_sliders()
         self.refresh_plot()
 
@@ -164,44 +167,96 @@ class AirfoilApp(AirfoilGUI):
         self.line_orig.set_data(self.orig_pts[:,0], self.orig_pts[:,1])
         self.ax_foil.relim(); self.ax_foil.autoscale_view(); self.canvas.draw()
 
+    def sweep_alphas(self):
+        """根据 From / To / Step 生成攻角列表（From > To 时自动交换）"""
+        a0, a1, da = self.spin_a0.value(), self.spin_a1.value(), self.spin_da.value()
+        if a0 > a1: a0, a1 = a1, a0
+        n = int(round((a1 - a0) / da)) + 1
+        return [round(a0 + i * da, 3) for i in range(n) if a0 + i * da <= a1 + 1e-9]
+
     def on_run_xfoil(self):
         if not hasattr(self, 'curr_up'): return
         yu, yl = self.line_up.get_ydata(), self.line_lo.get_ydata()
         coords = [(x, y) for x, y in zip(self.x_sample[::-1], yu[::-1])] + [(x, y) for x, y in zip(self.x_sample[1:], yl[1:])]
-        
-        self.btn_run.setEnabled(False); self.btn_run.setText("Solving...")
-        self.worker = XfoilWorker("current", coords, self.spin_alpha.value(), self.spin_re.value(), self.xfoil_path)
+        alphas = self.sweep_alphas()
+
+        self.btn_run.setEnabled(False); self.btn_run.setText(f"Solving {len(alphas)} angles...")
+        self.worker = XfoilWorker("current", coords, alphas, self.spin_re.value(), self.xfoil_path)
         self.worker.finished.connect(self.on_xfoil_finished)
         self.worker.start()
 
-    def on_xfoil_finished(self, res, cf_file, cp_file):
-        self.btn_run.setEnabled(True); self.btn_run.setText("Run XFOIL Analysis")
-        if res:
-            cl, cd, ld = res['cl'], res['cd'], res['ld']
-            self.lbl_cl.setText(f"CL: {cl:.4f}"); self.lbl_cd.setText(f"CD: {cd:.5f}"); self.lbl_ld.setText(f"L/D: {ld:.2f}")
-            _, _, sep_x = analyze_cf_data(cf_file)
-            sep_val = f"{sep_x:.3f}" if sep_x else "N/A"
-            self.lbl_sep.setText(f"Sep. Point: {sep_val}")
+    def on_xfoil_finished(self, results, n_requested):
+        self.btn_run.setEnabled(True); self.btn_run.setText("Run XFOIL Alpha Sweep")
+        if not results:
+            QMessageBox.warning(self, "XFOIL", "Convergence failed at every angle of attack.")
+            return
 
-            if os.path.exists(cp_file):
-                cp = np.loadtxt(cp_file, skiprows=3)
-                self.line_cp.set_data(cp[:, 0], cp[:, 2])
-                self.ax_cp.relim(); self.ax_cp.autoscale_view()
-            self.canvas.draw()
+        self.sweep = results
+        n_warn = sum(1 for r in results if r['warnings'])
+        self.sweep_info = f"{len(results)}/{n_requested} converged" + (f", {n_warn} questionable" if n_warn else "")
 
-            # 记录到 design_logs 文件夹中的文件
-            if self.current_log_file:
-                with open(self.current_log_file, mode='a', newline='', encoding='utf-8-sig') as f:
-                    writer = csv.writer(f)
+        # 整个扫描共用固定的 Cp 坐标范围，拖动滑块时曲线变化一目了然
+        all_cp = np.concatenate([r['cp'][:, 1] for r in results])
+        pad = 0.05 * (all_cp.max() - all_cp.min() or 1.0)
+        self.ax_cp.set_xlim(-0.02, 1.02)
+        self.ax_cp.set_ylim(all_cp.max() + pad, all_cp.min() - pad)  # 倒置：负 Cp 在上
+
+        # 滑块初始停在升阻比最大的攻角
+        best = max(range(len(results)), key=lambda i: results[i]['ld'] or float('-inf'))
+        self.sld_alpha.blockSignals(True)
+        self.sld_alpha.setRange(0, len(results) - 1)
+        self.sld_alpha.setValue(best)
+        self.sld_alpha.blockSignals(False)
+        self.alpha_group.setVisible(True)
+        self.show_sweep_point(best)
+
+        # 记录到 design_logs 文件夹中的文件（每个收敛攻角一行）
+        if self.current_log_file:
+            now = datetime.datetime.now().strftime('%H:%M:%S')
+            with open(self.current_log_file, mode='a', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                for r in results:
                     writer.writerow([
-                        datetime.datetime.now().strftime('%H:%M:%S'),
+                        now,
                         [round(w, 5) for w in self.curr_up],
                         [round(w, 5) for w in self.curr_lo],
-                        self.spin_re.value(), self.spin_alpha.value(),
-                        round(cl, 5), round(cd, 5), round(ld, 3), sep_val
+                        self.spin_re.value(), r['alpha'],
+                        round(r['cl'], 5), round(r['cd'], 5),
+                        round(r['ld'], 3) if r['ld'] is not None else "N/A",
+                        f"{r['sep_x']:.3f}" if r['sep_x'] else "N/A",
+                        "Questionable: " + "; ".join(r['warnings']) if r['warnings'] else "OK",
                     ])
-        else:
-            QMessageBox.warning(self, "XFOIL", "Convergence failed.")
+
+    def show_sweep_point(self, idx):
+        """滑块回调：显示第 idx 个收敛攻角的 Cp 分布与气动数据"""
+        if not getattr(self, 'sweep', None): return
+        r = self.sweep[idx]
+        self.line_cp.set_data(r['cp'][:, 0], r['cp'][:, 1])
+        self.ax_cp.set_title(f"Pressure Distribution (Cp)  @  Alpha = {r['alpha']:g}°")
+        self.lbl_alpha.setText(f"Alpha: {r['alpha']:g}°   ({self.sweep_info})")
+        self.lbl_cl.setText(f"CL: {r['cl']:.4f}"); self.lbl_cd.setText(f"CD: {r['cd']:.5f}")
+        self.lbl_ld.setText(f"L/D: {r['ld']:.2f}" if r['ld'] is not None else "L/D: N/A")
+        self.lbl_sep.setText(f"Sep. Point: {r['sep_x']:.3f}" if r['sep_x'] else "Sep. Point: N/A")
+
+        # 存疑攻角：Cp 曲线变红，并在图上和滑块下方给出原因
+        warnings = r['warnings']
+        self.line_cp.set_color('#c62828' if warnings else 'g')
+        self.cp_warn.set_visible(bool(warnings))
+        self.lbl_warn.setVisible(bool(warnings))
+        if warnings:
+            self.cp_warn.set_text("WARNING: XFOIL result questionable\n" + "\n".join("- " + w for w in warnings))
+            self.lbl_warn.setText("WARNING: XFOIL result at this angle is questionable. " + " | ".join(warnings))
+        self.canvas.draw_idle()
+
+    def clear_sweep(self):
+        self.sweep = None
+        self.alpha_group.setVisible(False)
+        self.line_cp.set_data([], [])
+        self.cp_warn.set_visible(False)
+        self.lbl_warn.setVisible(False)
+        self.ax_cp.set_title("Pressure Distribution (Cp)")
+        for lbl, txt in [(self.lbl_cl, "CL: -"), (self.lbl_cd, "CD: -"), (self.lbl_ld, "L/D: -"), (self.lbl_sep, "Separation: -")]:
+            lbl.setText(txt)
 
     def on_export_csv(self):
         # 默认导出路径设为 airfoils 文件夹
