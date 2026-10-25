@@ -1,0 +1,4 @@
+﻿生成时间: 2026-05-10 15:21:44
+Baseline Airfoil Path: d:\sw_test\tool_box_2.3\airfoils\naca3612_xy.csv
+Timestamp,Upper CST Weights,Lower CST Weights,Re,Alpha,Cl,Cd,L/D,Separation Point
+15:22:04,"[0.19199, 0.22137, 0.22726, 0.32235]","[-0.14697, -0.09505, -0.03168, 0.0004]",1000000.0,4.0,0.9573,0.00386,248.005,N/A

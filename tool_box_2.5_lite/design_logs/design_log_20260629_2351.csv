@@ -1,0 +1,4 @@
+﻿Generation Time: 2026-06-29 23:51:48
+Baseline Airfoil Path: d:\FBR_database\fbr project\tool_box_2.5_english\airfoils\naca2510_xy.dat
+Timestamp,Upper CST Weights,Lower CST Weights,Re,Alpha,Cl,Cd,L/D,Separation Point
+23:52:13,"[0.15958, 0.15785, 0.21027, 0.12615, 0.2497, 0.13734, 0.24583]","[-0.13117, -0.08378, -0.11099, -0.01889, -0.10913, 0.00522, -0.08143]",1000000.0,4.0,0.7538,0.00495,152.283,N/A
